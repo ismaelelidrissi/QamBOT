@@ -1,5 +1,5 @@
 {
-  "presenceTimeout": 60,
+  "presenceTimeout": 180,
   "leoBotId": "1438841964404674672",
   "mappings": {
     "1438833231461093438": "1438832740987437076",
