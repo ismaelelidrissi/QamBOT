@@ -1,4 +1,4 @@
-// Qambot.js (ESM-ready) — QamBOT improved (small fixes + better permission handling)
+// Qambot.js (ESM-ready) — QamBOT improved (safer disconnects, better perms, debounce writes)
 import dotenv from "dotenv";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
@@ -32,8 +32,49 @@ if (!existsSync(configPath)) {
   console.error("config.json not found. Create it as instructed.");
   process.exit(1);
 }
-const config = JSON.parse(readFileSync(configPath, "utf8"));
-const PRESENCE_TIMEOUT = Number(config.presenceTimeout || 60);
+let rawConfig = {};
+try {
+  rawConfig = JSON.parse(readFileSync(configPath, "utf8"));
+} catch (e) {
+  console.error("Failed to parse config.json:", e);
+  process.exit(1);
+}
+
+// Basic defaults + validation
+const DEBUG = Boolean(rawConfig.debug || process.env.DEBUG === "true");
+
+function logDebug(...args) {
+  if (DEBUG) console.log("[DEBUG]", ...args);
+}
+
+const config = {
+  presenceTimeout: rawConfig.presenceTimeout,
+  leoBotId: rawConfig.leoBotId || null,
+  mappings: rawConfig.mappings || {},
+  checkinChannelId: rawConfig.checkinChannelId || null,
+  checkinHour:
+    Number.isFinite(Number.parseInt(rawConfig.checkinHour, 10)) &&
+    Number.parseInt(rawConfig.checkinHour, 10) >= 0
+      ? Number.parseInt(rawConfig.checkinHour, 10)
+      : 9,
+  checkinMinute:
+    Number.isFinite(Number.parseInt(rawConfig.checkinMinute, 10)) &&
+    Number.parseInt(rawConfig.checkinMinute, 10) >= 0
+      ? Number.parseInt(rawConfig.checkinMinute, 10)
+      : 0,
+  debug: Boolean(rawConfig.debug || false),
+};
+
+let PRESENCE_TIMEOUT = Number.parseInt(config.presenceTimeout, 10);
+if (!Number.isFinite(PRESENCE_TIMEOUT) || PRESENCE_TIMEOUT <= 0) {
+  console.warn(
+    "Invalid presenceTimeout in config.json — using default 60s (was:",
+    config.presenceTimeout,
+    ")"
+  );
+  PRESENCE_TIMEOUT = 60;
+}
+
 const LEO_BOT_ID = config.leoBotId || null;
 const MAPPINGS = config.mappings || {};
 const CHECKIN_CHANNEL_ID = config.checkinChannelId || null;
@@ -49,12 +90,22 @@ if (existsSync(DATA_PATH)) {
   }
 }
 
-function saveData() {
+// --- debounced save
+let saveScheduled = false;
+function saveDataImmediate() {
   try {
     writeFileSync(DATA_PATH, JSON.stringify(DATA, null, 2));
   } catch (e) {
     console.error("Failed to save data.json", e);
   }
+}
+function saveData() {
+  if (saveScheduled) return;
+  saveScheduled = true;
+  setTimeout(() => {
+    saveScheduled = false;
+    saveDataImmediate();
+  }, 2000);
 }
 
 function ensureUser(id) {
@@ -64,8 +115,9 @@ function ensureUser(id) {
       streak: 0,
       lastCheckinDate: null,
       infractions: 0,
-      breakJoins: [], // timestamps of joins to break rooms
+      breakJoins: [],
     };
+    saveData();
   }
   return DATA.users[id];
 }
@@ -90,24 +142,23 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 const activeSessions = new Map();
-const breakStayTimeouts = new Map(); // key: userId -> timeoutId
+const breakStayTimeouts = new Map(); // key: userId_channelId -> timeoutId
 const BREAK_KEYWORDS = ["break", "coffee", "pause", "休息"];
 
-// ---------- DEDUPE + COOLDOWNS ----------
+// dedupe sets
 const recentHandledMessages = new Set();
 setInterval(() => recentHandledMessages.clear(), 10 * 1000);
-
 const recentFocusTriggers = new Set();
 
-// ----- DEBUG HELPERS (temporary) -----
+// debug logging hooks
 client.on("channelUpdate", (oldC, newC) => {
   try {
-    console.log(
-      "[DEBUG channelUpdate] old:",
+    logDebug(
+      "[channelUpdate] old:",
       oldC?.id,
       oldC?.name,
       "=> new:",
@@ -115,104 +166,86 @@ client.on("channelUpdate", (oldC, newC) => {
       newC?.name
     );
   } catch (e) {
-    console.error("[DEBUG channelUpdate error]", e);
+    console.error("[channelUpdate error]", e);
   }
 });
-
 client.on("messageCreate", (msg) => {
   try {
     if (!msg.guild) return;
     const preview = (msg.content || "").slice(0, 200).replace(/\n/g, " ");
-    console.log(
-      "[DEBUG messageCreate] guild:",
+    logDebug(
+      "[messageCreate] guild:",
       msg.guild.id,
       "author:",
       msg.author.id,
-      "name:",
-      msg.author.username,
       "content:",
       preview
     );
   } catch (e) {
-    console.error("[DEBUG messageCreate error]", e);
+    console.error("[messageCreate error]", e);
   }
 });
 
-// ready prints mapping info and available voice channels
 client.once("ready", async () => {
-  console.log(`Ready as ${client.user.tag} (DEBUG MODE)`);
+  console.log(`Ready as ${client.user.tag}`);
   try {
+    // mapping validation to surface config issues
     for (const [voiceId, textId] of Object.entries(MAPPINGS)) {
+      let found = false;
       for (const [, g] of client.guilds.cache) {
         const voice = g.channels.cache.get(voiceId);
         const text = g.channels.cache.get(textId);
         if (voice || text) {
           console.log(
-            `[DEBUG mapping] guild:${
+            `[MAPPING] guild:${
               g.id
             } mapping voice(${voiceId}) -> text(${textId}) found: voiceName='${
               voice?.name || "N/A"
             }' textName='${text?.name || "N/A"}'`
           );
+          found = true;
+          break;
         }
       }
+      if (!found) {
+        console.warn(
+          `[MAPPING WARN] mapping references channels not found in any cached guild: voice ${voiceId} -> text ${textId}`
+        );
+      }
     }
+
     for (const [, g] of client.guilds.cache) {
       const vcs = g.channels.cache.filter(
         (ch) => ch.type === ChannelType.GuildVoice
       );
-      console.log(`[DEBUG guild ${g.id}] voice channels:`);
+      console.log(`[GUILD ${g.id}] voice channels:`);
       for (const [, vc] of vcs) console.log(` - ${vc.id} => ${vc.name}`);
     }
 
-    // schedule daily checkin at config hour (default 9)
-    const cfgHour = Number(config.checkinHour ?? 9);
-    const cfgMinute = Number(config.checkinMinute ?? 0);
-    scheduleDailyCheckin(cfgHour, cfgMinute);
+    scheduleDailyCheckin(config.checkinHour, config.checkinMinute);
   } catch (e) {
-    console.error("[DEBUG ready error]", e);
+    console.error("[ready error]", e);
   }
 });
 
-// --- helper to get mapped text channel ---
+// helper to get mapped text channel
 function getNotifyChannelForVoice(guild, voiceChannelId) {
   const textId = MAPPINGS[voiceChannelId];
   if (!textId) return null;
   return guild.channels.cache.get(textId) || null;
 }
 
-// ---------- messageCreate (commands + detection) ----------
+// messageCreate (commands + triggers)
 client.on("messageCreate", async (message) => {
   try {
     if (!message.guild) return;
 
-    // quick dedupe
     if (recentHandledMessages.has(message.id)) return;
     recentHandledMessages.add(message.id);
 
     const content = (message.content || "").trim();
 
-    // --- Commands (prefix !) available to everyone ---
-    if (LEO_BOT_ID && message.author && message.author.id === LEO_BOT_ID) {
-      if (message.mentions?.channels?.size) {
-        for (const [, ch] of message.mentions.channels) {
-          const guildChannel = message.guild.channels.cache.get(ch.id);
-          if (guildChannel && guildChannel.type === ChannelType.GuildVoice) {
-            handleStartFocus(guildChannel, message.channel);
-            break;
-          }
-        }
-      } else {
-        const vcId = Object.keys(MAPPINGS).find(
-          (k) => MAPPINGS[k] === message.channel.id
-        );
-        if (vcId) {
-          const vc = message.guild.channels.cache.get(vcId);
-          if (vc) handleStartFocus(vc, message.channel);
-        }
-      }
-    }
-
+    // Always allow commands from users (help, checkin, xp, etc.)
     if (content.startsWith("!")) {
       const parts = content.slice(1).split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -224,12 +257,11 @@ client.on("messageCreate", async (message) => {
           .setDescription(
             "**🔥 كيفاش كيخدم QamBOT؟ كلشي مبسّط هنا:**\n\n" +
               "• اضغط **Present** في رسالة الـ Focus باش تسجل حضورك وتعطيك XP.\n" +
-              "• أوامر مفيدة: `!checkin`, `!xp`, `!streak`, `!leaderboard`, `!startfocus`.\n\n" +
+              "• أوامر مفيدة: `!checkin`, `!xp`, `!streak`, `!leaderboard`, `!startfocus`, `!endfocus`.\n\n" +
               "**أمثلة:**\n" +
               "• `!startfocus <voiceChannelId>` - ابدأ جلسة Focus تجريبية (يرسل رسالة Present في هاد القناة النصية).\n" +
               "• `!checkin` - تسجيل الحضور اليومي.\n" +
-              "• `!xp` - عرض XP.\n" +
-              "• `!leaderboard` - أفضل 5 حسب XP.\n"
+              "• `!xp` - عرض XP.\n"
           )
           .setFooter({
             text: "استعمل !startfocus لتجربة زر Present (أو تأكد من MAPPINGS في config.json)",
@@ -248,11 +280,8 @@ client.on("messageCreate", async (message) => {
           const yesterday = new Date(Date.now() - 86400000)
             .toISOString()
             .slice(0, 10);
-          if (u.lastCheckinDate === yesterday) {
-            u.streak = (u.streak || 0) + 1;
-          } else {
-            u.streak = 1;
-          }
+          if (u.lastCheckinDate === yesterday) u.streak = (u.streak || 0) + 1;
+          else u.streak = 1;
           u.lastCheckinDate = today;
           saveData();
           await message.reply(
@@ -301,31 +330,62 @@ client.on("messageCreate", async (message) => {
         const vcId =
           parts[1] ||
           Object.keys(MAPPINGS).find((k) => MAPPINGS[k] === message.channel.id);
-        if (!vcId) {
+        if (!vcId)
           return message.reply(
             "Provide a voiceChannelId or use this command in a mapped text channel."
           );
-        }
         const vc = message.guild.channels.cache.get(vcId);
         if (!vc) return message.reply("Voice channel not found.");
         handleStartFocus(vc, message.channel);
         return;
       }
+
+      if (cmd === "endfocus") {
+        // admin only: ManageGuild or ManageChannels or server owner
+        if (
+          !message.member.permissions.has(
+            PermissionsBitField.Flags.ManageGuild
+          ) &&
+          !message.member.permissions.has(
+            PermissionsBitField.Flags.ManageChannels
+          ) &&
+          message.author.id !== message.guild.ownerId
+        ) {
+          return message.reply("You lack permission to run this command.");
+        }
+        const vcIdArg = parts[1];
+        if (!vcIdArg)
+          return message.reply("Usage: `!endfocus <voiceChannelId>`");
+        const session = activeSessions.get(vcIdArg);
+        if (!session)
+          return message.reply("No active session for that voice channel.");
+        try {
+          if (session.timeout) clearTimeout(session.timeout);
+        } catch (e) {}
+        activeSessions.delete(vcIdArg);
+        // try to clear original message components
+        try {
+          const ch = message.guild.channels.cache.get(session.notifyChannelId);
+          if (ch && ch.isTextBased()) {
+            const msg = await ch.messages
+              .fetch(session.messageId)
+              .catch(() => null);
+            if (msg) await msg.edit({ components: [] }).catch(() => {});
+          }
+        } catch (e) {}
+        return message.reply("Session ended.");
+      }
     }
 
-    // If LEO_BOT_ID set, only accept triggers/messages from that bot for starting focus (after commands)
+    // If LEO_BOT_ID is set, ignore non-LEO non-command triggers (we still accepted commands above)
     if (LEO_BOT_ID && message.author.id !== LEO_BOT_ID) {
       return;
     }
 
     const txt = (message.content || "").toLowerCase();
 
-    // 1) check channel mentions to map to VC
-    if (
-      message.mentions &&
-      message.mentions.channels &&
-      message.mentions.channels.size > 0
-    ) {
+    // 1) channel mention mapping detection
+    if (message.mentions?.channels?.size > 0) {
       for (const [, ch] of message.mentions.channels) {
         const chId = ch.id;
         const guildChannel = message.guild.channels.cache.get(chId);
@@ -351,7 +411,7 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // 2) fallback keyword detection (simple)
+    // 2) fallback keyword detection
     if (
       txt.includes("in focus") ||
       txt.includes("focus started") ||
@@ -380,7 +440,7 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// ---------- voiceStateUpdate for break monitoring ----------
+// voiceStateUpdate — break monitoring
 client.on("voiceStateUpdate", (oldState, newState) => {
   try {
     const member = newState.member || oldState.member;
@@ -408,9 +468,11 @@ client.on("voiceStateUpdate", (oldState, newState) => {
           try {
             const freshMem = await newState.guild.members.fetch(member.id);
             if (freshMem.voice && freshMem.voice.channelId === newChan.id) {
-              await freshMem.send(
-                `Hey ${freshMem.user.username}, يبدو أنك في البريك أكثر من 15 دقيقة. هل تريد الرجوع للدراسة؟ 💪`
-              );
+              await freshMem
+                .send(
+                  `Hey ${freshMem.user.username}, يبدو أنك في البريك أكثر من 15 دقيقة. هل تريد الرجوع للدراسة؟`
+                )
+                .catch(() => {});
             }
           } catch (e) {
             /* ignore */
@@ -446,9 +508,11 @@ function recordBreakJoin(userId) {
           try {
             const mem = await g.members.fetch(userId).catch(() => null);
             if (mem) {
-              await mem.send(
-                `⏱️ لاحظت أنك تدخل غرفة البريك كثيرًا في آخر ساعة. حاول تقلل البريك وتزيد الفوكَس 😉`
-              );
+              await mem
+                .send(
+                  `⏱️ لاحظت أنك تدخل غرفة البريك كثيرًا في آخر ساعة. حاول تقلل البريك وتزيد الفوكَس 😉`
+                )
+                .catch(() => {});
               break;
             }
           } catch (e) {
@@ -462,27 +526,27 @@ function recordBreakJoin(userId) {
   }
 }
 
-// ---------- handleStartFocus (robust, stores customId + messageId in session) ----------
+// handleStartFocus (creates session, message with Present button)
 async function handleStartFocus(voiceChannel, messageChannel = null) {
   const guild = voiceChannel.guild;
   const vcId = voiceChannel.id;
 
   if (recentFocusTriggers.has(vcId)) {
-    console.log("[DEDUP FOCUS] ignoring duplicate trigger for", vcId);
+    logDebug("[DEDUP] ignoring trigger for", vcId);
     return;
   }
   recentFocusTriggers.add(vcId);
   setTimeout(() => recentFocusTriggers.delete(vcId), 5000);
 
   if (activeSessions.has(vcId)) {
-    console.log("Session already active for", vcId);
+    logDebug("Session already active for", vcId);
     return;
   }
 
   await guild.members.fetch();
   const membersInVC = voiceChannel.members.filter((m) => !m.user.bot);
   if (!membersInVC.size) {
-    console.log("No users in voice channel", voiceChannel.name);
+    logDebug("No users in voice channel", voiceChannel.name);
     return;
   }
 
@@ -494,7 +558,7 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
     return;
   }
 
-  // quick permissions check: need VIEW + SEND to post, and MOVE_MEMBERS to force-disconnect users later
+  // check bot send/view perms on the notify channel
   try {
     const botMember =
       guild.members.me || guild.members.cache.get(client.user.id);
@@ -510,14 +574,15 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
       return;
     }
   } catch (e) {
-    // ignore permission-check errors
+    /* ignore */
   }
 
   const waiting = new Set();
   const present = new Set();
   for (const [, mem] of membersInVC) waiting.add(mem.id);
 
-  const customId = `present_${vcId}_${Date.now()}`; // unique per session
+  // customId should remain reasonably short (Discord limit 100 chars). vcId is numeric (snowflake).
+  const customId = `present_${vcId}_${Date.now()}`;
   const button = new ButtonBuilder()
     .setCustomId(customId)
     .setLabel("✅ Present")
@@ -527,24 +592,23 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
   let sentMsg = null;
   try {
     sentMsg = await notifyChannel.send({
-      content: `**Focus started in** ${voiceChannel.name}\nIf you are present in the voice channel, press **Present** within ${PRESENCE_TIMEOUT} seconds or you will be disconnected.`,
+      content: `**Focus started in** ${voiceChannel.name}\nIf you are present in the voice channel, press **Present** within ${PRESENCE_TIMEOUT} seconds or you may be removed.`,
       components: [row],
       allowedMentions: { parse: [] },
     });
-    console.log(
+    logDebug(
       "[FOCUS] present message sent:",
       sentMsg.id,
       "in",
       notifyChannel.id
     );
   } catch (e) {
-    console.warn("Failed to send present message to mapped channel:", e);
+    console.warn("Failed to send present message with button:", e);
     try {
       sentMsg = await notifyChannel.send({
         content: `**Focus started in** ${voiceChannel.name}\n(⚠️ Failed to attach Present button; check bot perms)`,
         allowedMentions: { parse: [] },
       });
-      console.log("[FOCUS] fallback plain message sent:", sentMsg.id);
     } catch (err) {
       console.error("[FOCUS] cannot notify channel:", err);
       return;
@@ -564,7 +628,10 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
   };
   activeSessions.set(vcId, timerObj);
 
-  // Keep a reference to timeout so we can clear it if session cancelled
+  // cleanup listener: if message is deleted, cancel session
+  // (we use a global listener below, but quick check here to attach nothing else)
+
+  // timeout enforcement
   timerObj.timeout = setTimeout(async () => {
     try {
       const freshVC = guild.channels.cache.get(vcId);
@@ -580,62 +647,77 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
       );
       const toDisconnect = toCheck.filter((id) => !timerObj.present.has(id));
 
-      // check bot has permission to move members before attempting disconnects
+      // check MoveMembers permission in the voice channel context
       const botMember =
         guild.members.me || guild.members.cache.get(client.user.id);
       const canMove =
         botMember &&
-        botMember.permissions.has(PermissionsBitField.Flags.MoveMembers);
+        botMember
+          .permissionsIn(freshVC)
+          .has(PermissionsBitField.Flags.MoveMembers);
+
+      // If cannot move, we'll notify the mapped channel once (not DM everyone)
+      const notifyIfCannotMove = !canMove && timerObj.notifyChannelId;
 
       for (const id of toDisconnect) {
         try {
           const member = await guild.members.fetch(id);
           if (member && member.voice && member.voice.channelId === vcId) {
-            try {
-              if (canMove) {
+            if (canMove) {
+              try {
                 await member.voice.setChannel(null);
-              } else {
-                // fallback: send DM + notify channel if cannot disconnect
-                await member.send(
-                  "You were marked for disconnection for not pressing Present, but the bot lacks permission to move members."
-                );
-                if (notifyChannel && notifyChannel.isTextBased()) {
-                  await notifyChannel.send(
-                    `${member.user} did not press Present in time (bot lacks Move Members permission).`
-                  );
+              } catch (e) {
+                console.warn("Failed to setChannel(null):", e);
+                // notify mapped channel if available
+                if (timerObj.notifyChannelId) {
+                  const ch = guild.channels.cache.get(timerObj.notifyChannelId);
+                  if (ch && ch.isTextBased()) {
+                    await ch
+                      .send({
+                        content: `<@${member.id}> was marked for removal but moving failed. Please review.`,
+                        allowedMentions: { users: [member.id] },
+                      })
+                      .catch(() => {});
+                  }
                 }
               }
-            } catch (e) {
-              console.warn(
-                "Failed to disconnect member via setChannel. Trying voice.disconnect if available.",
-                e
-              );
-              try {
-                if (member.voice.disconnect) {
-                  await member.voice.disconnect();
+            } else {
+              // Inform mapped channel once
+              if (notifyIfCannotMove) {
+                const ch = guild.channels.cache.get(timerObj.notifyChannelId);
+                if (ch && ch.isTextBased()) {
+                  await ch
+                    .send({
+                      content: `<@${member.id}> was marked for removal for not pressing Present, but the bot lacks permission to move members. Please ask a moderator to review.`,
+                      allowedMentions: { users: [member.id] },
+                    })
+                    .catch(() => {});
                 }
-              } catch (e2) {
-                console.warn("voice.disconnect also failed", e2);
+              } else {
+                // fallback single DM (best-effort, avoid spam)
+                await member
+                  .send(
+                    "You were marked for removal for not pressing Present, but the bot lacks permission to move members. Please rejoin the focus session or contact a moderator."
+                  )
+                  .catch(() => {});
               }
             }
-            console.log(
+            logDebug(
               `Enforcement: processed ${member.user.tag} from ${voiceChannel.name}`
             );
             addInfraction(id);
           }
         } catch (err) {
-          console.warn("Failed to process member disconnect", id, err);
+          console.warn("Failed processing disconnect for", id, err);
         }
       }
 
-      // cleanup: remove active session and try to remove buttons
+      // cleanup session & try to remove button
       activeSessions.delete(vcId);
       if (sentMsg) {
         try {
-          await sentMsg.edit({ components: [] });
-        } catch (e) {
-          // ignore
-        }
+          await sentMsg.edit({ components: [] }).catch(() => {});
+        } catch (e) {}
       }
     } catch (err) {
       console.error("presence timeout handler error", err);
@@ -643,19 +725,18 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
     }
   }, PRESENCE_TIMEOUT * 1000);
 
-  console.log(
+  logDebug(
     `Enforcement started for ${voiceChannel.name} -> notify in ${notifyChannel.id}`
   );
 }
 
-// ---------- Interaction handler (mark present and award XP) ----------
+// Interaction handler
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (!interaction.isButton()) return;
     const customId = interaction.customId;
     if (!customId.startsWith("present_")) return;
 
-    // find vcId from customId
     const parts = customId.split("_"); // present_<vcId>_<ts>
     const vcId = parts[1];
     const session = activeSessions.get(vcId);
@@ -677,19 +758,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     await guild.members.fetch(memberId);
     const member = guild.members.cache.get(memberId);
-    if (!member) {
+    if (!member)
       return interaction.reply({
         content: "Member not found.",
         ephemeral: true,
       });
-    }
     if (!member.voice.channelId || member.voice.channelId !== vcId) {
       return interaction.reply({
         content: "You must be in the voice channel to mark Present.",
         ephemeral: true,
       });
     }
-
     if (session.present.has(memberId)) {
       return interaction.reply({
         content: "You've already marked Present.",
@@ -697,31 +776,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
     }
 
-    // mark present and award XP
     session.present.add(memberId);
     session.waiting.delete(memberId);
     addXP(memberId, 10);
 
-    // Build new content with present list
     const presentMentions = Array.from(session.present).map((id) => `<@${id}>`);
     const remaining = Array.from(session.waiting).length;
-    const newContent =
-      `**Focus started in** <#${session.voiceChannelId}> — Present recorded.\n\n` +
-      `✅ Marked present: ${presentMentions.join(", ") || "— none yet —"}\n` +
-      `⏱️ ${remaining} members still pending (press Present to confirm).`;
+    const newContent = `**Focus started in** <#${
+      session.voiceChannelId
+    }> — Present recorded.\n\n✅ Marked present: ${
+      presentMentions.join(", ") || "— none yet —"
+    }\n⏱️ ${remaining} members still pending (press Present to confirm).`;
 
-    // Keep same button (others can still press)
     const button = new ButtonBuilder()
       .setCustomId(session.customId)
       .setLabel("✅ Present")
       .setStyle(ButtonStyle.Success);
     const row = new ActionRowBuilder().addComponents(button);
 
-    // Use interaction.update to edit the original message (prevents extra notifications)
     try {
       await interaction.update({ content: newContent, components: [row] });
     } catch (e) {
-      // if update fails (message deleted or out-of-sync), fallback to ephemeral reply
       console.warn(
         "interaction.update failed, falling back to ephemeral reply:",
         e
@@ -737,7 +812,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ---------- helper: scheduling daily checkin ----------
+// cleanup active sessions if the present message is deleted
+client.on("messageDelete", (deleted) => {
+  try {
+    if (!deleted) return;
+    for (const [vcId, session] of activeSessions) {
+      if (session.messageId && session.messageId === deleted.id) {
+        try {
+          if (session.timeout) clearTimeout(session.timeout);
+        } catch (e) {}
+        activeSessions.delete(vcId);
+        logDebug(
+          "[CLEANUP] removed active session for vc",
+          vcId,
+          "because message was deleted"
+        );
+        break;
+      }
+    }
+  } catch (e) {
+    console.error("messageDelete handler error", e);
+  }
+});
+
+// daily checkin scheduling
 function scheduleDailyCheckin(hour = 9, minute = 0) {
   try {
     const now = new Date();
@@ -760,15 +858,17 @@ async function doDailyCheckin() {
     const today = new Date().toISOString().slice(0, 10);
     if (DATA.lastDailyAt === today) return;
     DATA.lastDailyAt = today;
-    saveData();
+    saveDataImmediate();
 
     if (CHECKIN_CHANNEL_ID) {
       for (const [, g] of client.guilds.cache) {
         const ch = g.channels.cache.get(CHECKIN_CHANNEL_ID);
         if (ch && ch.isTextBased()) {
-          await ch.send(
-            `📅 **Daily Check-in** — اضغط \`!checkin\` الآن لتسجل حضورك اليومي!`
-          );
+          await ch
+            .send(
+              `📅 **Daily Check-in** — اضغط \`!checkin\` الآن لتسجل حضورك اليومي!`
+            )
+            .catch(() => {});
         }
       }
     } else {
@@ -778,9 +878,11 @@ async function doDailyCheckin() {
           if (tId && !sent.has(tId)) {
             const ch = g.channels.cache.get(tId);
             if (ch && ch.isTextBased()) {
-              await ch.send(
-                `📅 **Daily Check-in** — اضغط \`!checkin\` الآن لتسجل حضورك اليومي!`
-              );
+              await ch
+                .send(
+                  `📅 **Daily Check-in** — اضغط \`!checkin\` الآن لتسجل حضورك اليومي!`
+                )
+                .catch(() => {});
               sent.add(tId);
             }
           }
@@ -792,16 +894,15 @@ async function doDailyCheckin() {
   }
 }
 
-// ---------- Graceful shutdown ----------
+// graceful shutdown
 process.on("SIGINT", () => {
   console.log("Shutting down...");
-  // clear pending session timers
   for (const [, s] of activeSessions) {
     try {
       if (s.timeout) clearTimeout(s.timeout);
     } catch (e) {}
   }
-  saveData();
+  saveDataImmediate();
   client.destroy();
   process.exit();
 });
