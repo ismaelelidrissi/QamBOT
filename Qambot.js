@@ -189,6 +189,24 @@ client.on("messageCreate", (msg) => {
 client.once("ready", async () => {
   console.log(`Ready as ${client.user.tag}`);
   try {
+    // Diagnostic: print MAPPINGS and mapped channels per guild
+    console.log("[CONFIG] MAPPINGS keys -> voiceId -> textId:");
+    console.log(MAPPINGS);
+    console.log("[CONFIG] active guilds and mapped channels:");
+    for (const [, g] of client.guilds.cache) {
+      for (const [vcId, tId] of Object.entries(MAPPINGS)) {
+        const vc = g.channels.cache.get(vcId);
+        const tx = g.channels.cache.get(tId);
+        if (vc || tx) {
+          console.log(
+            ` guild:${g.id} mapping ${vcId} -> ${tId} => vcName='${
+              vc?.name || "N/A"
+            }' txName='${tx?.name || "N/A"}'`
+          );
+        }
+      }
+    }
+
     // mapping validation to surface config issues
     for (const [voiceId, textId] of Object.entries(MAPPINGS)) {
       let found = false;
@@ -377,12 +395,133 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // If LEO_BOT_ID is set, ignore non-LEO non-command triggers (we still accepted commands above)
-    if (LEO_BOT_ID && message.author.id !== LEO_BOT_ID) {
-      return;
+    // Replace strict LEO gating: allow triggers if message is from LEO or if message is posted in a mapped text channel.
+    const mappedTextChannels = new Set(Object.values(MAPPINGS || {}));
+    if (LEO_BOT_ID) {
+      if (
+        !(
+          message.author.id === LEO_BOT_ID ||
+          mappedTextChannels.has(message.channel.id)
+        )
+      ) {
+        // not from leo bot and not in a mapped text channel -> ignore non-command triggers
+        return;
+      }
+    } else {
+      // no leo bot restriction: only accept messages that appear in mapped channels (avoid global triggers)
+      if (!mappedTextChannels.has(message.channel.id)) {
+        return;
+      }
     }
 
-    const txt = (message.content || "").toLowerCase();
+    // --- START: handle LeoBot start messages (put this after command handling in messageCreate)
+    try {
+      // only proceed if leoBotId configured and this message is from that bot
+      if (LEO_BOT_ID && message.author && message.author.id === LEO_BOT_ID) {
+        logDebug(
+          `[LEO-TRIGGER] message from leo bot in ${message.guild.id}:${message.channel.id}`
+        );
+
+        // 1) If leoBot posted in a mapped text channel, start the corresponding VC(s)
+        for (const [vcId, tId] of Object.entries(MAPPINGS)) {
+          if (tId === message.channel.id) {
+            const vc = message.guild.channels.cache.get(vcId);
+            if (vc && vc.type === ChannelType.GuildVoice) {
+              if (!activeSessions.has(vcId) && !recentFocusTriggers.has(vcId)) {
+                logDebug(
+                  `[LEO-TRIGGER] starting focus for ${vcId} because leo posted in mapped text ${tId}`
+                );
+                handleStartFocus(vc, message.channel).catch((e) =>
+                  console.error("leo-trigger error", e)
+                );
+                recentFocusTriggers.add(vcId);
+                setTimeout(() => recentFocusTriggers.delete(vcId), 5000);
+              }
+            }
+          }
+        }
+
+        // 2) If not directly mapped, try to match by text content / embed content to a VC name
+        const textToScan =
+          (message.content || "") +
+          " " +
+          (message.embeds && message.embeds[0]
+            ? (message.embeds[0].title || "") +
+              " " +
+              (message.embeds[0].description || "")
+            : "");
+
+        if (textToScan.trim()) {
+          const lower = textToScan.toLowerCase();
+          for (const [, g] of client.guilds.cache) {
+            if (g.id !== message.guild.id) continue; // only current guild
+            const vcs = g.channels.cache.filter(
+              (ch) => ch.type === ChannelType.GuildVoice
+            );
+            for (const [, vc] of vcs) {
+              const name = (vc.name || "").toLowerCase();
+              // match when leo's message mentions the channel name (loose match) or contains 'focus' + part of name
+              if (
+                name &&
+                (lower.includes(name) ||
+                  (lower.includes("focus") &&
+                    lower.includes(name.split(" ")[0])))
+              ) {
+                // start mapped VC if mapping exists, else start using channel's mapped text if available
+                if (
+                  !activeSessions.has(vc.id) &&
+                  !recentFocusTriggers.has(vc.id)
+                ) {
+                  const notifyCh =
+                    getNotifyChannelForVoice(message.guild, vc.id) ||
+                    message.channel;
+                  logDebug(
+                    `[LEO-TRIGGER] starting focus for ${vc.id} by name-match (${vc.name})`
+                  );
+                  handleStartFocus(vc, notifyCh).catch((e) =>
+                    console.error("leo-trigger name-match error", e)
+                  );
+                  recentFocusTriggers.add(vc.id);
+                  setTimeout(() => recentFocusTriggers.delete(vc.id), 5000);
+                }
+              }
+            }
+          }
+        }
+        // After processing leo message, return early to avoid duplicate handling below
+        return;
+      }
+    } catch (e) {
+      console.error("leo-trigger top-level error", e);
+    }
+    // --- END: handle LeoBot start messages
+
+    // AUTO-START on mapped text message: when a message appears in a mapped text channel, start the session for corresponding VC(s)
+    try {
+      if (mappedTextChannels.has(message.channel.id)) {
+        // find the corresponding voice channel(s) mapped to this text channel
+        for (const [vcId, tId] of Object.entries(MAPPINGS)) {
+          if (tId === message.channel.id) {
+            const guild = message.guild;
+            const vc = guild.channels.cache.get(vcId);
+            if (vc && vc.type === ChannelType.GuildVoice) {
+              if (!activeSessions.has(vcId) && !recentFocusTriggers.has(vcId)) {
+                logDebug(
+                  `[AUTO-START-TEXT] starting focus for ${vcId} triggered by message in ${message.channel.id}`
+                );
+                handleStartFocus(vc, message.channel).catch((e) =>
+                  console.error("auto-start-text error", e)
+                );
+                recentFocusTriggers.add(vcId);
+                setTimeout(() => recentFocusTriggers.delete(vcId), 5000);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("auto-start on mapped text message error", e);
+    }
 
     // 1) channel mention mapping detection
     if (message.mentions?.channels?.size > 0) {
@@ -411,7 +550,8 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // 2) fallback keyword detection
+    // 2) fallback keyword detection (kept but will be less necessary since mapped-text auto-start exists)
+    const txt = (message.content || "").toLowerCase();
     if (
       txt.includes("in focus") ||
       txt.includes("focus started") ||
@@ -440,91 +580,375 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-// voiceStateUpdate — break monitoring
-client.on("voiceStateUpdate", (oldState, newState) => {
-  try {
-    const member = newState.member || oldState.member;
-    if (!member || member.user.bot) return;
+// voiceStateUpdate — break monitoring + auto-start (mapping-only) + join enforcement + unmute enforcement
+// client.on("voiceStateUpdate", async (oldState, newState) => {
+//   try {
+//     const member =
+//       (newState && newState.member) || (oldState && oldState.member);
+//     if (!member || member.user.bot) return;
 
-    const oldChan = oldState.channel;
-    const newChan = newState.channel;
+//     const oldChan = oldState ? oldState.channel : null;
+//     const newChan = newState ? newState.channel : null;
 
-    if (oldChan && (!newChan || newChan.id !== oldChan.id)) {
-      if (isBreakChannel(oldChan)) {
-        const key = `${member.id}_${oldChan.id}`;
-        const t = breakStayTimeouts.get(key);
-        if (t) {
-          clearTimeout(t);
-          breakStayTimeouts.delete(key);
-        }
-      }
-    }
+//     // --- cleanup when leaving a break channel
+//     if (oldChan && (!newChan || newChan.id !== oldChan.id)) {
+//       if (isBreakChannel(oldChan)) {
+//         const key = `${member.id}_${oldChan.id}`;
+//         const t = breakStayTimeouts.get(key);
+//         if (t) {
+//           clearTimeout(t);
+//           breakStayTimeouts.delete(key);
+//         }
+//       }
+//     }
 
-    if (newChan && (!oldChan || oldChan.id !== newChan.id)) {
-      if (isBreakChannel(newChan)) {
-        recordBreakJoin(member.id);
-        const key = `${member.id}_${newChan.id}`;
-        const t = setTimeout(async () => {
-          try {
-            const freshMem = await newState.guild.members.fetch(member.id);
-            if (freshMem.voice && freshMem.voice.channelId === newChan.id) {
-              await freshMem
-                .send(
-                  `Hey ${freshMem.user.username}, يبدو أنك في البريك أكثر من 15 دقيقة. هل تريد الرجوع للدراسة؟`
-                )
-                .catch(() => {});
-            }
-          } catch (e) {
-            /* ignore */
-          }
-        }, 15 * 60 * 1000);
-        breakStayTimeouts.set(key, t);
-      }
-    }
-  } catch (e) {
-    console.error("voiceStateUpdate error", e);
-  }
-});
+//     // --- when joining a channel: handle break join recording and auto-start (mapping-only)
+//     if (newChan && (!oldChan || oldChan.id !== newChan.id)) {
+//       // record break join if it's a break channel
+//       // if (isBreakChannel(newChan)) {
+//       //   recordBreakJoin(member.id);
+//       //   const key = `${member.id}_${newChan.id}`;
+//       //   const t = setTimeout(async () => {
+//       //     try {
+//       //       const freshMem = await newState.guild.members.fetch(member.id);
+//       //       if (freshMem.voice && freshMem.voice.channelId === newChan.id) {
+//       //         await freshMem
+//       //           .send(
+//       //             `Hey ${freshMem.user.username}, يبدو أنك في البريك أكثر من 15 دقيقة. هل تريد الرجوع للدراسة؟`
+//       //           )
+//       //           .catch(() => {});
+//       //       }
+//       //     } catch (e) {
+//       //       /* ignore */
+//       //     }
+//       //   }, 15 * 60 * 1000);
+//       //   breakStayTimeouts.set(key, t);
+//       // }
 
-function isBreakChannel(channel) {
-  if (!channel || !channel.name) return false;
-  const name = channel.name.toLowerCase();
-  return BREAK_KEYWORDS.some((k) => name.includes(k));
-}
+//       // --- AUTO-START (mapping-only): start focus session automatically when members join a mapped voice channel
+//       try {
+//         if (!member.user.bot) {
+//           const mappedText = getNotifyChannelForVoice(
+//             newState.guild,
+//             newChan.id
+//           );
+//           if (mappedText) {
+//             // ensure at least one real user present
+//             const nonBotMembers = newChan.members.filter((m) => !m.user.bot);
+//             if (nonBotMembers.size > 0) {
+//               if (
+//                 !activeSessions.has(newChan.id) &&
+//                 !recentFocusTriggers.has(newChan.id)
+//               ) {
+//                 logDebug(
+//                   `[AUTO-START-MAP] starting focus for ${newChan.id} (mapped to ${mappedText.id}) due to join`
+//                 );
+//                 handleStartFocus(newChan, mappedText).catch((e) =>
+//                   console.error("auto-start-map error", e)
+//                 );
+//                 recentFocusTriggers.add(newChan.id);
+//                 setTimeout(() => recentFocusTriggers.delete(newChan.id), 5000);
+//               }
+//             }
+//           } else {
+//             logDebug(
+//               `[AUTO-START-MAP] no mapping for voice ${newChan.id} (${newChan.name})`
+//             );
+//           }
+//         }
+//       } catch (e) {
+//         console.error("auto-start on join error", e);
+//       }
 
-function recordBreakJoin(userId) {
-  const u = ensureUser(userId);
-  const now = Date.now();
-  u.breakJoins = u.breakJoins || [];
-  u.breakJoins = u.breakJoins.filter((t) => now - t < 60 * 60 * 1000);
-  u.breakJoins.push(now);
-  saveData();
+//       // --- JOIN ENFORCEMENT: if session active, enforce server-mute or move on rejoin
+//       // --- JOIN ENFORCEMENT: if session active, enforce server-mute or move on rejoin
+//        try {
+//       //   const session = activeSessions.get(newChan.id);
+//       //   if (session && !isBreakChannel(newChan)) {
+//       //     const SESSION_DURATION_MS = 50 * 60 * 1000; // 50 minutes
+//       //     const sessionAge = Date.now() - (session.startedAt || 0);
 
-  const recent = u.breakJoins.filter((t) => now - t < 60 * 60 * 1000);
-  if (recent.length >= 3) {
-    (async () => {
-      try {
-        for (const [, g] of client.guilds.cache) {
-          try {
-            const mem = await g.members.fetch(userId).catch(() => null);
-            if (mem) {
-              await mem
-                .send(
-                  `⏱️ لاحظت أنك تدخل غرفة البريك كثيرًا في آخر ساعة. حاول تقلل البريك وتزيد الفوكَس 😉`
-                )
-                .catch(() => {});
-              break;
-            }
-          } catch (e) {
-            /* ignore */
-          }
-        }
-      } catch (e) {
-        /* ignore */
-      }
-    })();
-  }
-}
+//       //     if (sessionAge < SESSION_DURATION_MS) {
+//       //       // ----- NEW: allow user if they joined while SELF-MUTED -----
+//       //       const userSelfMuted = Boolean(
+//       //         (newState &&
+//       //           typeof newState.selfMute !== "undefined" &&
+//       //           newState.selfMute) ||
+//       //           (member && member.voice && member.voice.selfMute)
+//       //       );
+
+//       //       if (userSelfMuted) {
+//       //         logDebug(
+//       //           `[JOIN-ENFORCE] ${member.id} joined ${newChan.id} while self-muted — allowed`
+//       //         );
+//       //       } else {
+//       //         // not self-muted -> enforcement logic
+//       //         const botMember =
+//       //           newState.guild.members.me ||
+//       //           newState.guild.members.cache.get(client.user.id);
+
+//       //         const permsInChannel =
+//       //           botMember && newChan ? botMember.permissionsIn(newChan) : null;
+
+//       //         const canServerMute =
+//       //           permsInChannel &&
+//       //           permsInChannel.has(PermissionsBitField.Flags.MuteMembers);
+
+//       //         const canMove =
+//       //           permsInChannel &&
+//       //           permsInChannel.has(PermissionsBitField.Flags.MoveMembers);
+
+//       //         if (canServerMute) {
+//       //           try {
+//       //             if (member.voice) {
+//       //               await member.voice.setMute(true);
+//       //             } else {
+//       //               const fetched = await newState.guild.members
+//       //                 .fetch(member.id)
+//       //                 .catch(() => null);
+//       //               if (fetched && fetched.voice)
+//       //                 await fetched.voice.setMute(true);
+//       //             }
+
+//       //             const notifyCh = getNotifyChannelForVoice(
+//       //               newState.guild,
+//       //               newChan.id
+//       //             );
+
+//       //             if (notifyCh && notifyCh.isTextBased()) {
+//       //               await notifyCh
+//       //                 .send({
+//       //                   content: `<@${member.id}> تم كتمك تلقائياً لأن جلسة Focus جارية — المايك مسموح فقط في قنوات البريك.`,
+//       //                   allowedMentions: { users: [member.id] },
+//       //                 })
+//       //                 .catch(() => {});
+//       //             }
+
+//       //             logDebug(
+//       //               `[JOIN-ENFORCE] server-muted ${member.id} on join to ${newChan.id}`
+//       //             );
+//       //             addInfraction(member.id);
+//       //           } catch (err) {
+//       //             console.warn("Failed to server-mute member on join:", err);
+//       //           }
+//       //         } else if (canMove) {
+//       //           try {
+//       //             const memb = await newState.guild.members
+//       //               .fetch(member.id)
+//       //               .catch(() => null);
+
+//       //             if (
+//       //               memb &&
+//       //               memb.voice &&
+//       //               memb.voice.channelId === newChan.id
+//       //             ) {
+//       //               await memb.voice.setChannel(null);
+
+//       //               const notifyCh = getNotifyChannelForVoice(
+//       //                 newState.guild,
+//       //                 newChan.id
+//       //               );
+
+//       //               if (notifyCh && notifyCh.isTextBased()) {
+//       //                 await notifyCh
+//       //                   .send({
+//       //                     content: `<@${member.id}> تم فصله لعودته مع مايك مُفعّل خلال جلسة Focus.`,
+//       //                     allowedMentions: { users: [member.id] },
+//       //                   })
+//       //                   .catch(() => {});
+//       //               }
+
+//       //               addInfraction(member.id);
+//       //             }
+//       //           } catch (err) {
+//       //             console.warn(
+//       //               "Failed to move member as fallback on join:",
+//       //               err
+//       //             );
+//       //           }
+//       //         } else {
+//       //           // cannot mute or move, notify only
+//       //           const notifyCh = getNotifyChannelForVoice(
+//       //             newState.guild,
+//       //             newChan.id
+//       //           );
+
+//       //           if (notifyCh && notifyCh.isTextBased()) {
+//       //             await notifyCh
+//       //               .send({
+//       //                 content: `<@${member.id}> رجوعك للجلسة مسجل، لكن البوت لا يملك صلاحية لكتم/فصل المستخدمين.`,
+//       //                 allowedMentions: { users: [member.id] },
+//       //               })
+//       //               .catch(() => {});
+//       //           }
+//       //         }
+//       //       }
+//       //     }
+//       //   }
+//       // } catch (e) {
+//       //   console.error("join-enforcement error", e);
+//       // }
+//     } // end newChan join block
+
+//     // --- UNMUTE DETECTION: selfMute true -> false (user unmuted)
+//     // try {
+//     //   const oldSelfMuted = oldState ? Boolean(oldState.selfMute) : true;
+//     //   const newSelfMuted = newState ? Boolean(newState.selfMute) : true;
+
+//     //   if (oldSelfMuted && !newSelfMuted) {
+//     //     const vcId = newState.channelId || (oldState && oldState.channelId);
+//     //     if (vcId) {
+//     //       const session = activeSessions.get(vcId);
+//     //       if (session) {
+//     //         const SESSION_DURATION_MS = 50 * 60 * 1000;
+//     //         const sessionAge = Date.now() - (session.startedAt || 0);
+
+//     //         if (sessionAge < SESSION_DURATION_MS) {
+//     //           const channel = newState.guild.channels.cache.get(vcId);
+//     //           if (channel && isBreakChannel(channel)) {
+//     //             logDebug(
+//     //               `[UNMUTE] ${member.id} unmuted in break channel ${vcId} — allowed.`
+//     //             );
+//     //           } else {
+//     //             const botMember =
+//     //               newState.guild.members.me ||
+//     //               newState.guild.members.cache.get(client.user.id);
+//     //             const canMove =
+//     //               botMember &&
+//     //               channel &&
+//     //               botMember
+//     //                 .permissionsIn(channel)
+//     //                 .has(PermissionsBitField.Flags.MoveMembers);
+
+//     //             addInfraction(member.id);
+
+//     //             if (canMove) {
+//     //               try {
+//     //                 await member.voice.setChannel(null);
+//     //                 await member
+//     //                   .send(
+//     //                     "تم فصلّك من جلسة الـ Focus لأنك فتحت المايك خلال الـ Focus (50 دقيقة). افتح المايك فقط في قنوات البريك."
+//     //                   )
+//     //                   .catch(() => {});
+//     //                 const notifyCh = getNotifyChannelForVoice(
+//     //                   newState.guild,
+//     //                   vcId
+//     //                 );
+//     //                 if (notifyCh && notifyCh.isTextBased()) {
+//     //                   await notifyCh
+//     //                     .send({
+//     //                       content: `<@${member.id}> تم فصله من ${
+//     //                         channel ? channel.name : "voice channel"
+//     //                       } لفتح المايك خلال جلسة الـ Focus.`,
+//     //                       allowedMentions: { users: [member.id] },
+//     //                     })
+//     //                     .catch(() => {});
+//     //                 }
+//     //                 logDebug(
+//     //                   `[ENFORCE] moved ${member.user.tag} out of VC ${vcId} for unmuting during session`
+//     //                 );
+//     //               } catch (e) {
+//     //                 console.warn(
+//     //                   "Failed to move member after unmute enforcement:",
+//     //                   e
+//     //                 );
+//     //                 const notifyCh = getNotifyChannelForVoice(
+//     //                   newState.guild,
+//     //                   vcId
+//     //                 );
+//     //                 if (notifyCh && notifyCh.isTextBased()) {
+//     //                   await notifyCh
+//     //                     .send({
+//     //                       content: `<@${member.id}> فتح المايك خلال الـ Focus لكن البوت فشل في فصله — الرجاء مراجعة المشرفين.`,
+//     //                       allowedMentions: { users: [member.id] },
+//     //                     })
+//     //                     .catch(() => {});
+//     //                 } else {
+//     //                   await member
+//     //                     .send(
+//     //                       "لقد فتحت المايك خلال جلسة الـ Focus، والبوت لم يتمكن من فصلّك. الرجاء الرجوع لقواعد الجلسة."
+//     //                     )
+//     //                     .catch(() => {});
+//     //                 }
+//     //               }
+//     //             } else {
+//     //               const notifyCh = getNotifyChannelForVoice(
+//     //                 newState.guild,
+//     //                 vcId
+//     //               );
+//     //               if (notifyCh && notifyCh.isTextBased()) {
+//     //                 await notifyCh
+//     //                   .send({
+//     //                     content: `<@${member.id}> فتح المايك خلال جلسة الـ Focus، لكن البوت لا يمتلك صلاحية MoveMembers. الرجاء من المشرفين التعامل مع الحالة.`,
+//     //                     allowedMentions: { users: [member.id] },
+//     //                   })
+//     //                   .catch(() => {});
+//     //               } else {
+//     //                 await member
+//     //                   .send(
+//     //                     "لقد فتحت المايك خلال جلسة الـ Focus، لكن البوت لا يمتلك صلاحية لفصلك. الرجاء الانصياع لقواعد الجلسة أو مراسلة المشرفين."
+//     //                   )
+//     //                   .catch(() => {});
+//     //               }
+//     //               logDebug(
+//     //                 `[ENFORCE] cannot move ${member.user.tag} (missing MoveMembers) — warned instead`
+//     //               );
+//     //             }
+//     //           }
+//     //         } // end session age
+//     //       } // session exists
+//     //     } // vcId exists
+//     //   } // unmute detected
+//     // } 
+//     //catch (e) {
+//     //   console.error("unmute enforcement error", e);
+//    //}
+// catch (e) {
+//     console.error("voiceStateUpdate error", e);
+//  }
+//  }
+// }
+// );
+
+// function isBreakChannel(channel) {
+//   if (!channel || !channel.name) return false;
+//   const name = channel.name.toLowerCase();
+//   return BREAK_KEYWORDS.some((k) => name.includes(k));
+// }
+
+//function recordBreakJoin(userId) {
+  // const u = ensureUser(userId);
+  // const now = Date.now();
+  // u.breakJoins = u.breakJoins || [];
+  // u.breakJoins = u.breakJoins.filter((t) => now - t < 60 * 60 * 1000);
+  // u.breakJoins.push(now);
+  // saveData();
+
+  // const recent = u.breakJoins.filter((t) => now - t < 60 * 60 * 1000);
+  // if (recent.length >= 3) {
+  //   (async () => {
+  //     try {
+  //       for (const [, g] of client.guilds.cache) {
+  //         try {
+  //           const mem = await g.members.fetch(userId).catch(() => null);
+  //           if (mem) {
+  //             await mem
+  //               .send(
+  //                 `⏱️ لاحظت أنك تدخل غرفة البريك كثيرًا في آخر ساعة. حاول تقلل البريك وتزيد الفوكَس 😉`
+  //               )
+  //               .catch(() => {});
+  //             break;
+  //           }
+  //         } catch (e) {
+  //           /* ignore */
+  //         }
+  //       }
+  //     } catch (e) {
+  //       /* ignore */
+  //     }
+  //   })();
+  // }
+//}
 
 // handleStartFocus (creates session, message with Present button)
 async function handleStartFocus(voiceChannel, messageChannel = null) {
@@ -543,7 +967,7 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
     return;
   }
 
-  await guild.members.fetch();
+  // Use the voice channel's cached members (avoid fetching entire guild members — prevents GuildMembersTimeout)
   const membersInVC = voiceChannel.members.filter((m) => !m.user.bot);
   if (!membersInVC.size) {
     logDebug("No users in voice channel", voiceChannel.name);
@@ -628,9 +1052,6 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
   };
   activeSessions.set(vcId, timerObj);
 
-  // cleanup listener: if message is deleted, cancel session
-  // (we use a global listener below, but quick check here to attach nothing else)
-
   // timeout enforcement
   timerObj.timeout = setTimeout(async () => {
     try {
@@ -668,7 +1089,6 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
                 await member.voice.setChannel(null);
               } catch (e) {
                 console.warn("Failed to setChannel(null):", e);
-                // notify mapped channel if available
                 if (timerObj.notifyChannelId) {
                   const ch = guild.channels.cache.get(timerObj.notifyChannelId);
                   if (ch && ch.isTextBased()) {
@@ -682,7 +1102,6 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
                 }
               }
             } else {
-              // Inform mapped channel once
               if (notifyIfCannotMove) {
                 const ch = guild.channels.cache.get(timerObj.notifyChannelId);
                 if (ch && ch.isTextBased()) {
@@ -694,7 +1113,6 @@ async function handleStartFocus(voiceChannel, messageChannel = null) {
                     .catch(() => {});
                 }
               } else {
-                // fallback single DM (best-effort, avoid spam)
                 await member
                   .send(
                     "You were marked for removal for not pressing Present, but the bot lacks permission to move members. Please rejoin the focus session or contact a moderator."
